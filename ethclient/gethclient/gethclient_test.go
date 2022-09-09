@@ -135,6 +135,9 @@ func TestGethClient(t *testing.T) {
 		}, {
 			"TestCallContract",
 			func(t *testing.T) { testCallContract(t, client) },
+		}, {
+			"TestSubscribePendingTxsWithCond",
+			func(t *testing.T) { testSubscribePendingTransactionsWithCond(t, client) },
 		},
 	}
 	t.Parallel()
@@ -325,5 +328,55 @@ func testCallContract(t *testing.T, client *rpc.Client) {
 	mapAcc[testAddr] = override
 	if _, err := ec.CallContract(context.Background(), msg, big.NewInt(0), &mapAcc); err != nil {
 		t.Fatalf("unexpected error: %v", err)
+	}
+}
+// go test -v gethclient_test.go gethclient.go
+func testSubscribePendingTransactionsWithCond(t *testing.T, client *rpc.Client) {
+	ec := New(client)
+	ethcl := ethclient.NewClient(client)
+	// Subscribe to Transactions
+	//ch := make(chan common.Hash)
+	ch := make(chan *types.Transaction)
+	ctx := context.Background()
+	cond := &filters.QueryCondition{
+		Froms: []string{
+			"0x71562b71999873DB5b286dF957af199Ec94617F7",
+		},
+		Tos: []string{
+			"0xb794f5ea0ba39494ce83a213fffba74279579269",
+		},
+		FuncIds: []string{
+			"0x23b872dd",
+		},
+	}
+	ec.c.Subscribe(ctx,"eth",ch,"newPendingTransactionsWithCond",cond)
+	// Send a transaction
+	chainID, err := ethcl.ChainID(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	// Create transaction
+	tx := types.NewTransaction(1, common.HexToAddress("0xb794f5ea0ba39494ce83a213fffba74279579269"), big.NewInt(1), 22000, big.NewInt(1), []byte{0x23, 0xb8, 0x72,0xdd})
+	//signer := types.LatestSignerForChainID(chainID)
+	signer := types.NewEIP155Signer(chainID)
+	signature, err := crypto.Sign(signer.Hash(tx).Bytes(), testKey)
+	if err != nil {
+		t.Fatal(err)
+	}
+	signedTx, err := tx.WithSignature(signer, signature)
+	if err != nil {
+		t.Fatal(err)
+	}
+	// Send transaction
+	//err = ethcl.SendTransaction(context.Background(), signedTx)
+	err = ethcl.SendTransaction(context.Background(), signedTx)
+
+	if err != nil {
+		t.Fatal(err)
+	}
+	// Check that the transaction was send over the channel
+	hash := <-ch
+	if hash.Hash() != signedTx.Hash() {
+		t.Fatalf("Invalid tx hash received, got %v, want %v", hash, signedTx.Hash())
 	}
 }

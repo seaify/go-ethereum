@@ -19,6 +19,7 @@ package filters
 import (
 	"context"
 	"fmt"
+	"github.com/ethereum/go-ethereum/crypto"
 	"math/big"
 	"math/rand"
 	"reflect"
@@ -726,4 +727,82 @@ func flattenLogs(pl [][]*types.Log) []*types.Log {
 		logs = append(logs, l...)
 	}
 	return logs
+}
+// go test -v filter_system_test.go filter_system.go filter.go api.go
+func TestPendingTxFilterWithParams(t *testing.T) {
+	t.Parallel()
+	var (
+		db           = rawdb.NewMemoryDatabase()
+		backend, sys = newTestFilterSystem(t, db, Config{})
+		api          = NewFilterAPI(sys, false)
+
+		// 需要对这个txs，进行签名
+		transactions = []*types.Transaction{
+			types.NewTransaction(0, common.HexToAddress("0xb794f5ea0ba39494ce83a213fffba74279579268"), new(big.Int), 0, new(big.Int), nil),
+			types.NewTransaction(1, common.HexToAddress("0xb794f5ea0ba39494ce83a213fffba74279579268"), new(big.Int), 0, new(big.Int), nil),
+			types.NewTransaction(2, common.HexToAddress("0xb794f5ea0ba39494ce83a213fffba74279579269"), new(big.Int), 0, new(big.Int), nil),
+			types.NewTransaction(3, common.HexToAddress("0xb794f5ea0ba39494ce83a213fffba74279579269"), new(big.Int), 0, new(big.Int), nil),
+
+			types.NewTransaction(
+				4,
+				common.HexToAddress("0xb794f5ea0ba39494ce83a213fffba74279579269"),
+				new(big.Int),
+				0,
+				new(big.Int),
+				[]byte{0x23, 0xb8, 0x72,0xdd},
+			),
+		}
+		sendTxs []*types.Transaction
+		txs []*types.Transaction
+	)
+
+	key, _ := crypto.GenerateKey()
+	addr := crypto.PubkeyToAddress(key.PublicKey)
+	signer := types.NewEIP155Signer(big.NewInt(18))
+	sendTxs  = make([]*types.Transaction,0)
+	for _, tx := range(transactions) {
+		tt, err := types.SignTx(tx,signer,key)
+		if err != nil {
+			t.Fatal(err)
+		}
+		sendTxs = append(sendTxs, tt)
+	}
+
+	cond := &QueryCondition{
+		Froms: []string{
+			addr.String(),
+		},
+		Tos: []string{
+			"0xb794f5ea0ba39494ce83a213fffba74279579269",
+		},
+		FuncIds: []string{
+			"0x23b872dd",
+		},
+	}
+	fid0 := api.NewPendingTransactionFilterWithCond(cond)
+	time.Sleep(1 * time.Second)
+	backend.txFeed.Send(core.NewTxsEvent{Txs: sendTxs})
+
+	timeout := time.Now().Add(1 * time.Second)
+	for {
+		results, err := api.GetFilterChanges(fid0)
+		if err != nil {
+			t.Fatalf("Unable to retrieve logs: %v", err)
+		}
+		h := results.([]*types.Transaction)
+		txs = append(txs, h...)
+		fmt.Printf("%d",len(txs))
+		if len(txs) >= 1 {
+			break
+		}
+		// check timeout
+		if time.Now().After(timeout) {
+			break
+		}
+		time.Sleep(100 * time.Millisecond)
+	}
+	if len(txs) != 1 {
+		t.Errorf("invalid number of transactions, want %d transactions(s), got %d", 2, len(txs))
+		return
+	}
 }

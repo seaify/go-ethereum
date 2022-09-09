@@ -22,6 +22,7 @@ import (
 	"errors"
 	"fmt"
 	"math/big"
+	"strings"
 	"sync"
 	"time"
 
@@ -131,6 +132,147 @@ func (api *FilterAPI) NewPendingTransactionFilter() rpc.ID {
 	}()
 
 	return pendingTxSub.ID
+}
+// NewPendingTransactionFilterWithCond
+// use from, to, matched_id to filter the txs
+
+func (api *FilterAPI) NewPendingTransactionFilterWithCond(cond *QueryCondition) rpc.ID {
+	var (
+		pendingTxs   = make(chan []*types.Transaction)
+		pendingTxSub = api.events.SubscribePendingTxs(pendingTxs)
+	)
+	api.filtersMu.Lock()
+	api.filters[pendingTxSub.ID] = &filter{typ: PendingTransactionsSubscription, deadline: time.NewTimer(api.timeout), txs: make([]*types.Transaction, 0), s: pendingTxSub}
+	api.filtersMu.Unlock()
+	go func() {
+		for {
+			select {
+			case pTx := <-pendingTxs:
+				api.filtersMu.Lock()
+				if f, found := api.filters[pendingTxSub.ID]; found {
+					for _, p := range(pTx) {
+						if cond.Filter(p) {
+							f.txs = append(f.txs, p)
+						}
+					}
+				}
+				api.filtersMu.Unlock()
+			case <-pendingTxSub.Err():
+				api.filtersMu.Lock()
+				delete(api.filters, pendingTxSub.ID)
+				api.filtersMu.Unlock()
+				return
+			}
+		}
+	}()
+	return pendingTxSub.ID
+}
+type QueryCondition struct {
+	Froms 	[]string 	`json:"froms"`
+	Tos 	[]string 	`json:"tos"`
+	FuncIds []string 	`json:"func_ids"`
+}
+
+func GetFromByTx(tx *types.Transaction) string {
+	chainId := tx.ChainId()
+	signer := types.NewEIP155Signer(chainId)
+	cfrom, err := types.Sender(signer, tx)
+	if err != nil {
+		//log.Error("types.Sender: ", err)
+		return ""
+	}
+	return cfrom.String()
+}
+
+func GetFuncIdByTx(tx *types.Transaction) string {
+	inputData := tx.Data()
+	if len(inputData) <4 {
+		return ""
+	}
+	inputDataStr := fmt.Sprintf("0x%x%x%x%x",
+		inputData[0],
+		inputData[1],
+		inputData[2],
+		inputData[3])
+	return inputDataStr
+}
+
+func (q *QueryCondition) Filter(tx *types.Transaction) bool {
+	//验证Tos
+	tosMatch := false
+	for _, to := range(q.Tos) {
+		if strings.EqualFold(to, tx.To().String()) || to == "*"{
+			tosMatch = true
+			break
+		}
+	}
+	//如果to中不命中，则false
+	if !tosMatch {
+		return false
+	}
+	//验证from
+	fromsMatch := false
+	cfrom := GetFromByTx(tx)
+	for _, from := range(q.Froms) {
+		if strings.EqualFold(from,cfrom) || from == "*" {
+			fromsMatch = true
+			break
+		}
+	}
+	if !fromsMatch {
+		return false
+	}
+	//验证func_id
+	funcidMatch := false
+	funcId := GetFuncIdByTx(tx)
+	for _, fid := range(q.FuncIds) {
+		if strings.EqualFold(funcId,fid) || fid == "*" {
+			funcidMatch = true
+			break
+		}
+	}
+	if !funcidMatch {
+		return false
+	}
+	//验证from
+	return true
+}
+
+func (api *FilterAPI) NewPendingTransactionsWithCond(ctx context.Context, cond *QueryCondition) (*rpc.Subscription, error) {
+
+	notifier, supported := rpc.NotifierFromContext(ctx)
+	if !supported {
+		return &rpc.Subscription{}, rpc.ErrNotificationsUnsupported
+	}
+	rpcSub := notifier.CreateSubscription()
+	go func() {
+		//txHashes := make(chan []common.Hash, 128)
+		//pendingTxSub := api.events.SubscribePendingTxs(txHashes)
+		txs := make(chan []*types.Transaction, 128)
+		pendingTxSub := api.events.SubscribePendingTxs(txs)
+
+		for {
+			select {
+			//case hashes := <-txHashes:
+			case txs := <-txs:
+				// To keep the original behaviour, send a single tx hash in one notification.
+				// TODO(rjl493456442) Send a batch of tx hashes in one notification
+				for _, tx := range txs {
+					if cond.Filter(tx) {
+						notifier.Notify(rpcSub.ID, tx)
+					}
+				}
+			case <-rpcSub.Err():
+				pendingTxSub.Unsubscribe()
+				return
+			case <-notifier.Closed():
+				pendingTxSub.Unsubscribe()
+				return
+			}
+		}
+	}()
+
+	return rpcSub, nil
 }
 
 // NewPendingTransactions creates a subscription that is triggered each time a
